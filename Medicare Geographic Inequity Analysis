@@ -1,0 +1,213 @@
+Created on Sat May  2 14:34:12 2026
+
+@author: coten
+"""
+
+# ============================================================
+# Medicare Geographic Inequity Analysis
+# Data: CMS Medicare Physician & Other Practitioners by Provider and Service, 2021
+# ============================================================
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error, r2_score
+from sklearn.preprocessing import LabelEncoder
+import matplotlib.pyplot as plt
+import warnings
+warnings.filterwarnings("ignore")
+
+# ── 1. LOAD DATA IN CHUNKS ───────────────────────────────────
+DATA_PATH = "C://Users//coten//OneDrive//Machine Learning Class//Medicare_Physician_Other_Practitioners_by_Provider_and_Service_2021 (1)//Medicare_Physician_Other_Practitioners_by_Provider_and_Service_2021.csv"
+
+KEEP_COLS = [
+    "Rndrng_NPI",
+    "Rndrng_Prvdr_Type",
+    "HCPCS_Cd",
+    "Place_Of_Srvc",
+    "Tot_Srvcs",
+    "Avg_Mdcr_Pymt_Amt",
+    "Rndrng_Prvdr_State_Abrvtn",
+    "Rndrng_Prvdr_Zip5",
+    "Rndrng_Prvdr_RUCA",
+]
+
+print("Loading CMS dataset in chunks...")
+chunks = []
+chunk_size = 200_000
+
+for i, chunk in enumerate(pd.read_csv(DATA_PATH, usecols=KEEP_COLS,
+                                       low_memory=False, chunksize=chunk_size)):
+    if i == 0:
+        print("Raw payment samples:", chunk["Avg_Mdcr_Pymt_Amt"].head(20).tolist())
+        print("Dtype:", chunk["Avg_Mdcr_Pymt_Amt"].dtype)
+
+    chunk["Avg_Mdcr_Pymt_Amt"] = pd.to_numeric(
+        chunk["Avg_Mdcr_Pymt_Amt"].astype(str).str.replace(",", "").str.replace("$", ""), errors="coerce"
+    )
+    chunk["Tot_Srvcs"] = pd.to_numeric(
+        chunk["Tot_Srvcs"].astype(str).str.replace(",", "").str.replace("$", ""), errors="coerce"
+    )
+
+    if i == 0:
+        print("After conversion:", chunk["Avg_Mdcr_Pymt_Amt"].head(20).tolist())
+        print("Non-null count:", chunk["Avg_Mdcr_Pymt_Amt"].notna().sum())
+        print("Greater than 0:", (chunk["Avg_Mdcr_Pymt_Amt"] > 0).sum())
+
+    chunk = chunk[chunk["Avg_Mdcr_Pymt_Amt"] > 0]
+    chunk.dropna(subset=["Avg_Mdcr_Pymt_Amt", "HCPCS_Cd", "Rndrng_Prvdr_Type"], inplace=True)
+    chunks.append(chunk)
+    print(f"  Chunk {i+1} loaded: {len(chunk):,} rows")
+
+df = pd.concat(chunks, ignore_index=True)
+print(f"\nFinal dataset: {len(df):,} records")
+
+# ── 2. SAMPLE FOR SPEED ──────────────────────────────────────
+if len(df) > 1_000_000:
+    df = df.sample(n=1_000_000, random_state=42)
+    print("Sampled to 1,000,000 rows for speed")
+
+# ── 3. ENCODE CATEGORICAL FEATURES ───────────────────────────
+le_hcpcs = LabelEncoder()
+le_prov  = LabelEncoder()
+le_place = LabelEncoder()
+
+df["HCPCS_enc"]    = le_hcpcs.fit_transform(df["HCPCS_Cd"].astype(str))
+df["ProvType_enc"] = le_prov.fit_transform(df["Rndrng_Prvdr_Type"].astype(str))
+df["Place_enc"]    = le_place.fit_transform(df["Place_Of_Srvc"].astype(str))
+
+# ── 4. DEFINE FEATURES & TARGET ──────────────────────────────
+FEATURES = ["HCPCS_enc", "ProvType_enc", "Place_enc", "Tot_Srvcs"]
+TARGET   = "Avg_Mdcr_Pymt_Amt"
+
+X = df[FEATURES].fillna(0)
+y = df[TARGET]
+
+# ── 5. TRAIN / TEST SPLIT ────────────────────────────────────
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42
+)
+print(f"\nTrain: {len(X_train):,}  |  Test: {len(X_test):,}")
+
+# ── 6. TRAIN MODEL ───────────────────────────────────────────
+print("\nTraining model (geography excluded)...")
+gbm = HistGradientBoostingRegressor(
+    max_iter=200,
+    max_depth=5,
+    learning_rate=0.05,
+    random_state=42,
+)
+gbm.fit(X_train, y_train)
+print("Training complete!")
+
+# ── 7. EVALUATE ──────────────────────────────────────────────
+y_pred = gbm.predict(X_test)
+mae = mean_absolute_error(y_test, y_pred)
+r2  = r2_score(y_test, y_pred)
+print(f"\nTest MAE : ${mae:,.2f}")
+print(f"Test R²  : {r2:.4f}")
+
+# ── 8. COMPUTE RESIDUALS ─────────────────────────────────────
+print("\nComputing residuals on full dataset...")
+df["Predicted_Pay"] = gbm.predict(X)
+df["Residual"]      = df[TARGET] - df["Predicted_Pay"]
+
+# ── 9. AGGREGATE RESIDUALS BY STATE ──────────────────────────
+state_residuals = (
+    df.groupby("Rndrng_Prvdr_State_Abrvtn")["Residual"]
+    .agg(["mean", "median", "count"])
+    .reset_index()
+    .rename(columns={
+        "Rndrng_Prvdr_State_Abrvtn": "State",
+        "mean":   "Mean_Residual",
+        "median": "Median_Residual",
+        "count":  "N_Records",
+    })
+    .sort_values("Mean_Residual")
+)
+print("\nBottom 5 underpaid states:")
+print(state_residuals.head(5).to_string(index=False))
+print("\nTop 5 overpaid states:")
+print(state_residuals.tail(5).to_string(index=False))
+
+
+# ── 10. RURAL / URBAN BREAKDOWN ──────────────────────────────
+if "Rndrng_Prvdr_RUCA" in df.columns:
+    print("\nSample RUCA values:", df["Rndrng_Prvdr_RUCA"].dropna().head(20).tolist())
+    
+    def classify_rural(x):
+        try:
+            code = int(float(str(x).strip()))
+            return "Rural" if code >= 4 else "Urban"
+        except:
+            return "Unknown"
+    
+    df["Rural"] = df["Rndrng_Prvdr_RUCA"].apply(classify_rural)
+    
+    print("Rural/Urban counts:")
+    print(df["Rural"].value_counts())
+    
+    rural_summary = (
+        df[df["Rural"] != "Unknown"]
+        .groupby("Rural")["Residual"]
+        .agg(["mean", "median", "count"])
+        .rename(columns={"mean": "Mean_Residual", "median": "Median_Residual", "count": "N"})
+    )
+    print("\nRural vs Urban residuals:")
+    print(rural_summary)
+
+# ── 11. FEATURE IMPORTANCE PLOT ──────────────────────────────
+
+
+from sklearn.inspection import permutation_importance
+print("Calculating feature importance...")
+perm = permutation_importance(gbm, X_test, y_test, n_repeats=5, random_state=42)
+importances = pd.Series(perm.importances_mean, index=FEATURES).sort_values()
+
+fig, ax = plt.subplots(figsize=(7, 4))
+importances.plot(kind="barh", ax=ax, color="steelblue")
+ax.set_title("Feature Importance (Gradient Boosting)")
+ax.set_xlabel("Importance")
+plt.tight_layout()
+plt.savefig("feature_importance.png", dpi=150)
+plt.show()
+print("Saved: feature_importance.png")
+
+# ── 12. STATE RESIDUAL BAR CHART ─────────────────────────────
+fig, ax = plt.subplots(figsize=(16, 6))
+colors = ["#d73027" if v < 0 else "#4575b4" for v in state_residuals["Mean_Residual"]]
+ax.bar(state_residuals["State"], state_residuals["Mean_Residual"], color=colors)
+ax.axhline(0, color="black", linewidth=0.8)
+ax.set_title("Mean Payment Residual by State\n(Red = Underpaid  |  Blue = Overpaid vs. Procedure Baseline)")
+ax.set_xlabel("State")
+ax.set_ylabel("Mean Residual ($)")
+plt.xticks(rotation=90, fontsize=7)
+plt.tight_layout()
+plt.savefig("state_residuals.png", dpi=150)
+plt.show()
+print("Saved: state_residuals.png")
+
+
+# ── 13. RURAL VS URBAN BAR CHART ─────────────────────────────
+if "Rural" in df.columns:
+    rural_plot = (
+        df[df["Rural"] != "Unknown"]
+        .groupby("Rural")["Residual"]
+        .mean()
+    )
+    fig, ax = plt.subplots(figsize=(5, 4))
+    colors = ["#d73027" if v < 0 else "#4575b4" for v in rural_plot]
+    ax.bar(rural_plot.index, rural_plot.values, color=colors)
+    ax.axhline(0, color="black", linewidth=0.8)
+    ax.set_title("Mean Payment Residual\nRural vs Urban")
+    ax.set_ylabel("Mean Residual ($)")
+    plt.tight_layout()
+    plt.savefig("rural_urban_residuals.png", dpi=150)
+    plt.show()
+    print("Saved: rural_urban_residuals.png")
+
+# ── 14. SAVE OUTPUTS ─────────────────────────────────────────
+state_residuals.to_csv("state_residuals.csv", index=False)
+df[["Rndrng_NPI", "HCPCS_Cd", "Rndrng_Prvdr_State_Abrvtn",
+    TARGET, "Predicted_Pay", "Residual"]].to_csv("provider_residuals.csv", index=False)
+print("\nOutputs saved: state_residuals.csv, provider_residuals.csv")
